@@ -1,0 +1,14 @@
+tiers:
+  free:
+    limit: 100 # requests
+    window: 60 # seconds
+  
+  pro:
+    limit: 1000
+    window: 60
+
+  enterprise:
+    limit: 10000
+    window: 60
+  
+default_tier: free
