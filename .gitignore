@@ -29,6 +29,7 @@ ENV/
 rls-venv/
 .zencode/
 .zenflow/
+vrls/
 
 # Environment Variables
 .env
