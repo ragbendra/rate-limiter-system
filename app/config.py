@@ -31,8 +31,6 @@ class RateLimitConfig(BaseModel):
             raise ValueError(f"Default tier '{self.default_tier}' is not defined in tiers")
         return self
 
-
-
 def load_config() -> RateLimitConfig:
     with open("config.yaml", "r") as f:
         yaml_config = yaml.safe_load(f)
@@ -49,7 +47,4 @@ class Settings:
             self.rate_limit_config.tiers[self.rate_limit_config.default_tier],
         )
 
-
-
 settings = Settings()
-
