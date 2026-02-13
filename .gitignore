@@ -55,11 +55,12 @@ vrls/
 htmlcov/
 *.cover
 .hypothesis/
+app/test_rate_limiter.py
 
 # Logs
 *.log
 logs/
-
+AGENTS.md
 # Redis dump
 dump.rdb
 

@@ -59,13 +59,13 @@ python main.py
 tiers:
   free:
     limit: 100
-    window: 3600  # 1 hour
+    window: 60  # seconds
   pro:
     limit: 1000
-    window: 3600
+    window: 60
   enterprise:
     limit: 10000
-    window: 3600
+    window: 60
 
 default_tier: free
 ```
