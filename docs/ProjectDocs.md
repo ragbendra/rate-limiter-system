@@ -550,4 +550,3 @@ Together the suite guarantees:
 > The service enforces rate limits correctly, consistently, safely, and independently for all clients.
 
 This verifies **production‑level behavior** rather than implementation details.
-

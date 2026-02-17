@@ -169,8 +169,6 @@ rate-limiter-system/
 │   ├── config.py              # Configuration loading (env + YAML) with Pydantic validation
 │   ├── rate_limiter.py        # Token Bucket algorithm implementation
 │   ├── redis_client.py        # Async Redis connection with retry logic
-│   ├── concurrency_test.py    # Script to test race conditions with concurrent requests
-│   └── test_rate_limiter.py   # Standalone rate limiter smoke test
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py            # Pytest fixtures (async client, Redis flush)
@@ -217,12 +215,6 @@ pytest
 | `test_pro_tier_higher_limit`     | Pro tier returns `limit: 1000`                   |
 
 ### Concurrency Testing
-
-A standalone script is provided to test Redis behavior under concurrent requests (useful for observing race conditions):
-
-```bash
-python app/concurrency_test.py
-```
 
 > **Note:** Race conditions are a known limitation of the current JSON-based state reads. A Lua script approach would make the check-and-decrement operation atomic.
 
