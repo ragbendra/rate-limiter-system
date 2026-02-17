@@ -56,7 +56,7 @@ htmlcov/
 *.cover
 .hypothesis/
 app/test_rate_limiter.py
-
+app/concurrency_test.py
 # Logs
 *.log
 logs/
