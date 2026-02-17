@@ -86,7 +86,3 @@ async def rate_limit(request: RateLimitRequest):
         reset_at=result["reset_at"],
         limit=result["limit"]
     )
-
-
-# if __name__ == "__main__":
-#     asyncio.run(main())
