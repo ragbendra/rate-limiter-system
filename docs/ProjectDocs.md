@@ -246,3 +246,308 @@ In this project:
 
 This results in simpler application logic and fewer runtime surprises.
 
+---
+---
+
+# FastAPI Application Layer
+
+This section explains how the rate limiter is exposed as an HTTP service. The API acts as a thin execution layer: it validates requests, delegates logic to the rate limiter core, and formats responses.
+
+The API does **not** implement rate limiting logic itself. All business rules exist in `rate_limiter.py`.
+
+---
+
+## 16. Application Lifecycle
+
+The application uses FastAPI **lifespan events** to manage Redis connections.
+
+**Startup:**
+- Establish connection to Redis
+- Service becomes ready only after Redis is reachable
+
+**Shutdown:**
+- Gracefully close Redis connection
+- Prevents hanging sockets and resource leaks
+
+This guarantees:
+- Every request runs with a valid Redis client
+- No lazy connection creation during traffic
+
+---
+
+## 17. Data Contracts
+
+### Request Model
+
+The client sends:
+
+```json
+{
+  "identifier": "user:123",
+  "tier": "free"
+}
+```
+
+Rules:
+- `identifier` uniquely identifies the caller
+- `tier` is optional — missing tier defaults to `"free"`
+
+### Response Model
+
+**Successful request:**
+
+```json
+{
+  "allowed": true,
+  "tokens_remaining": 99,
+  "reset_at": 1700000000.0,
+  "limit": 100
+}
+```
+
+**Rate limited:**
+
+```json
+{
+  "allowed": false,
+  "tokens_remaining": 0,
+  "reset_at": 1700000000.0,
+  "limit": 100,
+  "retry_after": 60
+}
+```
+
+---
+
+## 18. Endpoints
+
+### GET /health
+
+**Purpose:** Operational readiness check.
+
+Behavior:
+- Pings Redis
+- Confirms dependency availability
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "redis": "connected"
+}
+```
+
+If Redis is unavailable: **HTTP 503** is returned.
+
+This endpoint is designed for load balancers and container orchestration systems.
+
+### POST /check
+
+**Purpose:** Evaluate whether a request should be allowed.
+
+Flow:
+1. Validate that the tier exists in configuration
+2. Call rate limiter core
+3. Convert result into API response
+
+| Scenario         | HTTP Status |
+|------------------|-------------|
+| Invalid tier     | 400         |
+| Internal failure | 500         |
+
+---
+
+## 19. Error Handling Strategy
+
+| Code | Meaning                                |
+|------|----------------------------------------|
+| 400  | Client error (bad tier)                |
+| 429  | Rate limit exceeded (from limiter)     |
+| 503  | Dependency failure (Redis down)        |
+| 500  | Unexpected internal error              |
+
+The API layer never hides system state.
+
+---
+
+## 20. Architectural Responsibility
+
+**API Layer:**
+- Input validation
+- Output formatting
+- Dependency lifecycle
+- HTTP semantics
+
+**Rate Limiter Core:**
+- Token calculations
+- Redis state management
+- Algorithm correctness
+
+This separation allows:
+- Algorithm testing without HTTP
+- API changes without touching logic
+- Independent scalability
+
+---
+
+## 21. API Guarantees
+
+The API guarantees:
+
+- Deterministic validation
+- No business logic duplication
+- Stateless request handling
+- Externalized state in Redis
+
+---
+---
+
+# API Testing Documentation
+
+This section explains how the rate limiter service is tested from a client's perspective. The goal is not verifying Python functions, but verifying **service guarantees** through observable behavior.
+
+The tests simulate how a real consumer interacts with the system:
+- Sends HTTP requests
+- Receives responses
+- Relies on response semantics
+
+This represents **behavioral contract testing**.
+
+---
+
+## 22. Testing Strategy
+
+The system depends on:
+- FastAPI application
+- Redis state storage
+- Token bucket algorithm
+
+Because of this, unit testing individual functions is insufficient. We instead test **observable behavior** using an async HTTP client.
+
+We validate:
+
+| Category      | Meaning                              |
+|---------------|--------------------------------------|
+| Availability  | Service is reachable                 |
+| Correctness   | Tokens decrement properly            |
+| Persistence   | Redis state survives across requests |
+| Safety        | Invalid input handled safely         |
+| Protection    | Limit enforced                       |
+| Isolation     | Users do not affect each other       |
+| Configuration | Tier limits applied correctly        |
+
+---
+
+## 23. Shared Test Setup (`conftest.py`)
+
+### Why this file exists
+
+Tests require:
+1. Redis connected
+2. Redis clean before each test
+3. Async HTTP client
+
+Instead of repeating this setup in every test, fixtures provide a reusable environment.
+
+### Client Fixture
+
+Creates an `AsyncClient` connected to the FastAPI app.
+
+Steps:
+1. Connect Redis
+2. Create in‑memory HTTP client
+3. Run test
+4. Close Redis
+
+This ensures each test interacts with a real running application instance.
+
+### flush_redis Fixture
+
+Automatically clears the database before every test.
+
+Why required: Rate limiting depends on stored state. If state persists between tests, results become non‑deterministic.
+
+Therefore every test starts from identical conditions.
+
+---
+
+## 24. Test Groups
+
+### 1. Health Check
+
+**Purpose:** Verify service readiness for traffic.
+
+Guarantees:
+- API reachable
+- Redis reachable
+- System safe to send requests
+
+This protects load balancers from routing traffic to broken instances.
+
+### 2. Valid Request Behavior
+
+Ensures normal users are not incorrectly blocked.
+
+Verified:
+- First request allowed
+- Token count decreases
+- Default tier works
+
+This confirms basic service functionality.
+
+### 3. Invalid Input Handling
+
+Ensures bad client input does not crash the server.
+
+- Invalid tier → **400** response
+
+This distinguishes client error from server failure — important for monitoring systems.
+
+### 4. Rate Limit Enforcement
+
+Core guarantee of the project.
+
+Behavior:
+- N requests → allowed
+- N+1 request → rejected
+
+Also provides retry information.
+
+**If this test fails, the system is not a rate limiter.**
+
+### 5. Identifier Isolation
+
+Ensures independent quotas per user.
+
+Without this: one abusive user would block all others.
+
+This validates key‑based state separation.
+
+### 6. Tier Differences
+
+Ensures configuration correctness.
+
+Paid tiers must have higher limits. This prevents billing inconsistencies.
+
+---
+
+## 25. Why Async HTTP Testing
+
+The system is:
+- Asynchronous
+- Network‑facing
+- Stateful (external storage)
+
+Therefore the correct testing method is **integration testing via HTTP**, not direct function calls.
+
+---
+
+## 26. What These Tests Prove
+
+Together the suite guarantees:
+
+> The service enforces rate limits correctly, consistently, safely, and independently for all clients.
+
+This verifies **production‑level behavior** rather than implementation details.
+

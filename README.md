@@ -4,11 +4,26 @@ A flexible, Redis-backed rate limiting system with configurable tiers and fail-s
 
 ## Features
 
-- **Multi-tier rate limiting** (free, pro, enterprise, etc.)
-- **Redis-backed** for distributed rate limiting
-- **Configurable** via YAML and environment variables
+- **Token Bucket Rate Limiting** — smooth, burst-friendly algorithm
+- **Multi-tier rate limiting** (free, pro, enterprise) with per-user isolation
+- **FastAPI REST API** with `/health` and `/check` endpoints
+- **Redis-backed** for distributed, persistent rate limiting
+- **Configurable** via YAML (`config.yaml`) and environment variables (`.env`)
 - **Fail-safe modes** (fail-open or fail-closed on Redis unavailability)
-- **Health checks** for monitoring
+- **Async Redis client** with automatic retry logic (3 retries, 2s delay)
+- **Pydantic validation** for request/response schemas
+- **Health checks** for monitoring Redis connectivity
+- **Comprehensive test suite** using `pytest-asyncio` and `httpx`
+
+## How It Works — Token Bucket Algorithm
+
+The system uses a **Token Bucket** algorithm to control request rates:
+
+1. Each user starts with a full bucket of tokens (e.g., 100 for `free` tier).
+2. Every request consumes **1 token**.
+3. Tokens refill continuously at a rate of `limit / window` tokens per second.
+4. If the bucket is empty, the request is **denied** with a `429 Too Many Requests` response.
+5. Bucket state (tokens + last refill timestamp) is stored in Redis with a TTL of `2× window`.
 
 ## Requirements
 
@@ -48,7 +63,73 @@ redis-server
 ### 4. Run the Application
 
 ```bash
-python main.py
+uvicorn main:app --reload
+```
+
+The API server starts at `http://localhost:8000`. Interactive docs are available at `http://localhost:8000/docs`.
+
+## API Endpoints
+
+### `GET /health` — Health Check
+
+Returns the service and Redis connection status.
+
+```bash
+curl http://localhost:8000/health
+```
+
+**Response (200):**
+```json
+{
+  "status": "ok",
+  "redis": "connected"
+}
+```
+
+### `POST /check` — Check Rate Limit
+
+Checks whether a request is allowed for the given identifier and tier.
+
+**Request Body:**
+| Field        | Type   | Required | Description                              |
+|--------------|--------|----------|------------------------------------------|
+| `identifier` | string | Yes      | Unique key for the user/client (e.g. `user:123`) |
+| `tier`       | string | No       | Rate limit tier (`free`, `pro`, `enterprise`). Defaults to `free`. |
+
+```bash
+curl -X POST http://localhost:8000/check \
+  -H "Content-Type: application/json" \
+  -d '{"identifier": "user:123", "tier": "free"}'
+```
+
+**Response (200 — Allowed):**
+```json
+{
+  "allowed": true,
+  "tokens_remaining": 99,
+  "reset_at": 1700000060.0,
+  "limit": 100,
+  "retry_after": null
+}
+```
+
+**Response (429 — Rate Limited):**
+```json
+{
+  "detail": {
+    "allowed": false,
+    "retry_after": 60,
+    "reset_at": 1700000060.0,
+    "limit": 100
+  }
+}
+```
+
+**Response (400 — Invalid Tier):**
+```json
+{
+  "detail": "Invalid tier: invalid_tier"
+}
 ```
 
 ## Configuration
@@ -58,11 +139,13 @@ python main.py
 ```yaml
 tiers:
   free:
-    limit: 100
-    window: 60  # seconds
+    limit: 100    # requests
+    window: 60    # seconds
+
   pro:
     limit: 1000
     window: 60
+
   enterprise:
     limit: 10000
     window: 60
@@ -72,44 +155,36 @@ default_tier: free
 
 ### Environment Variables (`.env`)
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `REDIS_URL` | Redis connection URL | `redis://localhost:6379/0` |
-| `LOG_LEVEL` | Logging level | `INFO` |
-| `FAILURE_MODE` | Behavior on Redis failure (`open` or `closed`) | `open` |
-
-## Usage Example
-
-```python
-from app.config import Settings
-from app.redis_client import RedisClient
-
-# Load configuration
-settings = Settings()
-
-# Initialize Redis
-redis_client = RedisClient(settings.redis_url)
-await redis_client.connect()
-
-# Get tier configuration
-tier = settings.get_tier("pro")
-print(f"Limit: {tier.limit}, Window: {tier.window}s")
-```
+| Variable    | Description                                      | Default                    |
+|-------------|--------------------------------------------------|----------------------------|
+| `REDIS_URL` | Redis connection URL                             | `redis://localhost:6379`   |
+| `LOG_LEVEL` | Logging level                                    | `INFO`                     |
+| `FAIL_MODE` | Behavior on Redis failure (`open` or `closed`)   | `closed`                   |
 
 ## Project Structure
 
 ```
 rate-limiter-system/
 ├── app/
-│   ├── config.py          # Configuration loading and validation
-│   └── redis_client.py    # Redis connection management
+│   ├── config.py              # Configuration loading (env + YAML) with Pydantic validation
+│   ├── rate_limiter.py        # Token Bucket algorithm implementation
+│   ├── redis_client.py        # Async Redis connection with retry logic
+│   ├── concurrency_test.py    # Script to test race conditions with concurrent requests
+│   └── test_rate_limiter.py   # Standalone rate limiter smoke test
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py            # Pytest fixtures (async client, Redis flush)
+│   └── test_api.py            # API integration tests (health, rate limit, tiers)
 ├── docs/
-│   └── ProjectDocs.md     # Detailed documentation
-├── tests/                 # Unit and integration tests
-├── config.yaml            # Rate limit tier definitions
-├── docker-compose.yml     # Redis container setup
-├── main.py                # Application entry point
-└── requirements.txt       # Python dependencies
+│   └── ProjectDocs.md         # Detailed design documentation
+├── config.yaml                # Rate limit tier definitions
+├── docker-compose.yml         # Redis container setup
+├── main.py                    # FastAPI application entry point
+├── pytest.ini                 # Pytest configuration (asyncio_mode = auto)
+├── requirements.txt           # Production dependencies
+├── requirements-dev.txt       # Development dependencies (pytest, black, ruff, mypy)
+├── .env.example               # Environment variable template
+└── .gitignore
 ```
 
 ## Development
@@ -122,21 +197,47 @@ pip install -r requirements-dev.txt
 
 ### Run Tests
 
+The test suite uses `pytest-asyncio` with `httpx.AsyncClient` against the real FastAPI app and a live Redis instance.
+
 ```bash
 pytest
 ```
 
+**Test coverage includes:**
+
+| Test                              | Description                                     |
+|-----------------------------------|-------------------------------------------------|
+| `test_health_check`              | Health endpoint returns `ok` + Redis status      |
+| `test_rate_limit_allowed`        | First request is allowed with correct token count |
+| `test_tokens_decrement`          | Tokens decrease with each request                |
+| `test_default_tier`              | Default tier (`free`) is used when none specified |
+| `test_invalid_tier`              | Returns `400` for an unknown tier                |
+| `test_rate_limit_exceeded`       | Returns `429` after exhausting all tokens        |
+| `test_different_identifiers_independent` | Different users have independent buckets  |
+| `test_pro_tier_higher_limit`     | Pro tier returns `limit: 1000`                   |
+
+### Concurrency Testing
+
+A standalone script is provided to test Redis behavior under concurrent requests (useful for observing race conditions):
+
+```bash
+python app/concurrency_test.py
+```
+
+> **Note:** Race conditions are a known limitation of the current JSON-based state reads. A Lua script approach would make the check-and-decrement operation atomic.
+
 ## Health Check
 
-Check if Redis is available:
-
-```python
-is_healthy = await redis_client.health_check()
+```bash
+curl http://localhost:8000/health
 ```
 
 ## Shutdown
 
 ```bash
+# Stop the API server
+# (Ctrl+C in the terminal running uvicorn)
+
 # Stop Redis container
 docker-compose down
 ```

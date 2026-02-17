@@ -58,33 +58,34 @@ async def health_check():
 
 @app.post("/check", response_model=RateLimitResponse)
 async def rate_limit(request: RateLimitRequest):
-    
-    tier = request.tier or "free"
+    tier = request.tier or settings.rate_limit_config.default_tier
 
     if tier not in settings.rate_limit_config.tiers:
         raise HTTPException(status_code=400, detail=f"Invalid tier: {tier}")
 
-    config = settings.rate_limit_config.tiers[tier]
-    limit = config.limit
-    window = config.window
+    result = await rate_limiter.check_rate_limit(
+        identifier=request.identifier,
+        tier=tier
+    )
 
-    try:
-        result = await rate_limiter.check_rate_limit(
-            identifier=request.identifier,
-            tier=tier
+    # Return 429 if rate limited
+    if not result["allowed"]:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "allowed": False,
+                "retry_after": result.get("retry_after"),
+                "reset_at": result["reset_at"],
+                "limit": result["limit"]
+            }
         )
 
-        return RateLimitResponse(
-            allowed=result["allowed"],
-            tokens_remaining=result["tokens_remaining"],
-            reset_at=result["reset_at"],
-            limit=result["limit"],
-            retry_after=result.get("retry_after")
-        )
-
-    except Exception:
-        logger.exception("Rate limit check failed")
-        raise HTTPException(status_code=500, detail="Internal server error")
+    return RateLimitResponse(
+        allowed=result["allowed"],
+        tokens_remaining=result["tokens_remaining"],
+        reset_at=result["reset_at"],
+        limit=result["limit"]
+    )
 
 
 # if __name__ == "__main__":
