@@ -13,6 +13,29 @@ async def test_health_check(client: AsyncClient):
     assert data["redis"] == "connected"
 
 
+@pytest.mark.asyncio
+async def test_health_returns_rate_limit_header(client: AsyncClient):
+    """Test /health returns X-RateLimit-Remaining header for portfolio demo."""
+    response = await client.get("/health")
+    assert response.status_code == 200
+    assert "x-ratelimit-remaining" in response.headers
+    remaining = int(response.headers["x-ratelimit-remaining"])
+    assert remaining >= 0
+
+
+@pytest.mark.asyncio
+async def test_check_returns_rate_limit_headers(client: AsyncClient):
+    """Test /check returns X-RateLimit-* headers."""
+    response = await client.post("/check", json={
+        "identifier": "user:header_test",
+        "tier": "free"
+    })
+    assert response.status_code == 200
+    assert "x-ratelimit-remaining" in response.headers
+    assert "x-ratelimit-limit" in response.headers
+    assert int(response.headers["x-ratelimit-limit"]) == 100
+
+
 # 2. Valid Request Tests
 @pytest.mark.asyncio
 async def test_rate_limit_allowed(client: AsyncClient):

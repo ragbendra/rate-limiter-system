@@ -64,5 +64,6 @@ AGENTS.md
 # Redis dump
 dump.rdb
 
+helpDocs/
 # Docker
 .dockerignore
