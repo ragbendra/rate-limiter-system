@@ -4,16 +4,18 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from app.redis_client import redis_client
-from app.rate_limiter import rate_limiter
+from app.rate_limiter import RateLimiterBusy, rate_limiter
 from app.config import settings
+from redis.exceptions import RedisError
 import logging
 from typing import Optional
 
+logging.basicConfig(level=settings.env.log_level.upper())
 logger = logging.getLogger(__name__)
 
 class RateLimitRequest(BaseModel):
     identifier: str
-    tier: str = None
+    tier: Optional[str] = None
 
 
 class RateLimitResponse(BaseModel):
@@ -66,6 +68,8 @@ async def health_check():
             "status": "ok",
             "redis": "connected" if pong else "unreachable",
         }
+        if not pong:
+            raise HTTPException(status_code=503, detail="Redis unavailable")
 
         # Run a demo rate-limit check so we can surface X-RateLimit-* headers
         # for the portfolio "Try It" button.
@@ -94,10 +98,23 @@ async def rate_limit(request: RateLimitRequest):
     if tier not in settings.rate_limit_config.tiers:
         raise HTTPException(status_code=400, detail=f"Invalid tier: {tier}")
 
-    result = await rate_limiter.check_rate_limit(
-        identifier=request.identifier,
-        tier=tier
-    )
+    try:
+        result = await rate_limiter.check_rate_limit(
+            identifier=request.identifier,
+            tier=tier
+        )
+    except RateLimiterBusy:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Rate limiter busy"},
+            headers={"Retry-After": "1"},
+        )
+    except (RedisError, ConnectionError):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Redis unavailable"},
+            headers={"Retry-After": "1"},
+        )
 
     rate_headers = {
         "X-RateLimit-Remaining": str(result["tokens_remaining"]),
@@ -107,6 +124,7 @@ async def rate_limit(request: RateLimitRequest):
 
     # Return 429 if rate limited
     if not result["allowed"]:
+        rate_headers["Retry-After"] = str(result["retry_after"])
         return JSONResponse(
             status_code=429,
             content={

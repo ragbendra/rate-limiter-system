@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport

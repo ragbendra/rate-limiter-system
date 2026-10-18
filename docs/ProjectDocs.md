@@ -1,285 +1,143 @@
 # Configuration and Redis Setup
 
-This document explains how configuration loading and Redis connection management are implemented in this project. It is written to help anyone reading the code (including my future self) quickly understand **what exists, why it exists, and how the pieces fit together**, without needing to read every line of code first.
-
-The focus is on **clarity and intent**, not just implementation details.
+This document explains the configuration, Redis connection, token-bucket algorithm, HTTP API, and tests in this repository. It is intended to make the code easier to read without replacing the code as the source of behavior.
 
 ---
 
 ## 1. Overall Idea
 
-This project depends on two kinds of external inputs:
+The service has two external inputs: environment configuration and a Redis server. `app/config.py` loads environment values and `config.yaml`; `app/redis_client.py` manages the async Redis client. The FastAPI application calls these components from `main.py`.
 
-1. **Configuration** (environment variables and YAML files)
-2. **Redis** (an external service required at runtime)
-
-Both are handled explicitly and early, so that:
-- Invalid configuration is caught at startup
-- Redis availability is verified before the app does any work
-- The rest of the code can assume things are already valid
-
-To achieve this, the project uses:
-- `config.py` → for loading and validating configuration
-- `redis_client.py` → for managing the Redis connection lifecycle
+Redis is required for normal operation because the token-bucket state is stored there. The application attempts to connect during startup and raises the connection error after three failed attempts.
 
 ---
 
 ## 2. Configuration (`config.py`)
 
-### Purpose
-
-`config.py` is responsible for:
-- Loading environment variables
-- Loading `config.yaml`
-- Validating all configuration using strict schemas
-- Providing a single `settings` object that the rest of the app uses
-
-The goal is to **centralize configuration and validation** instead of spreading it across the codebase.
+`config.py` loads environment values, reads `config.yaml`, validates the YAML models with Pydantic, and exposes the resulting `settings` object. Rate limits are not read from environment variables.
 
 ---
 
 ## 3. Environment Configuration
 
-### What it represents
+The supported environment variables are:
 
-Environment variables are used for values that:
-- Change between environments (local, staging, production)
-- Contain secrets or connection details
+| Variable | Default | Meaning |
+|---|---|---|
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
+| `LOG_LEVEL` | `INFO` | Application log level |
 
-Examples:
-- Redis connection URL
-- Log level
-- Failure mode
-
-### How it is modeled
-
-An `EnvConfig` model is defined using Pydantic. This model:
-- Describes what environment variables are expected
-- Provides default values where appropriate
-- Automatically validates types
-
-Loading is done through a small helper function that reads from `os.getenv()` and constructs an `EnvConfig` object.
-
-If required values are missing or invalid, the application fails immediately.
+`load_env()` applies these defaults when variables are unset. There is no `FAIL_MODE` setting and the application does not implement fail-open or fail-closed behavior.
 
 ---
 
 ## 4. Rate Limit Configuration (YAML)
 
-### What it represents
+`config.yaml` defines the `free`, `pro`, and `enterprise` tiers. Each tier has a positive integer `limit` and `window`. `default_tier` names the tier used when a request omits `tier`.
 
-`config.yaml` defines rate-limiting tiers, for example:
-- free
-- pro
-- enterprise
-
-Each tier has:
-- a request limit
-- a time window
-
-There is also a `default_tier` used as a fallback.
-
----
-
-### How it is modeled
-
-Two Pydantic models are used:
-
-1. `Tier`
-   - Represents a single tier
-   - Ensures `limit` and `window` are positive integers
-
-2. `RateLimitConfig`
-   - Holds all tiers in a dictionary
-   - Stores the `default_tier`
-   - Validates that `default_tier` actually exists
-
-This ensures the YAML file is both **structurally correct** and **logically consistent**.
+`Tier` and `RateLimitConfig` validate the values. `RateLimitConfig` also checks that `default_tier` is present in the tier dictionary.
 
 ---
 
 ## 5. Settings Object
 
-A `Settings` class is used to group all configuration together.
-
-When a `Settings` object is created:
-- Environment variables are loaded and validated
-- YAML configuration is loaded and validated
-
-The rest of the application interacts only with this object, instead of reloading config multiple times.
-
-Example responsibility of `Settings`:
-- Provide access to Redis configuration
-- Resolve a tier name with a safe fallback to the default tier
-
-This makes configuration usage predictable and centralized.
+`Settings` loads the environment and YAML configuration once when the module is imported. Its `get_tier()` method returns the named tier, or the configured default tier if called with an unknown name. The HTTP layer validates a supplied tier before calling the limiter, so an unknown HTTP tier returns `400`.
 
 ---
 
 ## 6. Redis Client (`redis_client.py`)
 
-### Purpose
+`RedisClient` owns the async Redis client and its lifecycle. The client is built with `redis.asyncio.BlockingConnectionPool.from_url()` using `max_connections=100` and a 10-second pool timeout, then wrapped in `redis.asyncio.Redis(connection_pool=pool)`.
 
-`redis_client.py` manages the **entire lifecycle of the Redis connection**. It is responsible for:
-- Connecting to Redis at startup
-- Verifying Redis availability
-- Providing safe access to the Redis client
-- Closing the connection at shutdown
-
-It does **not** contain business logic or rate-limiting logic.
+The larger pool permits concurrent optimistic-lock transactions to hold connections while they watch a key.
 
 ---
 
 ## 7. RedisClient Class
 
-The Redis connection is wrapped inside a `RedisClient` class. This allows:
-- Keeping connection state in one place
-- Avoiding global variables scattered across the project
-- Enforcing correct usage through explicit methods
-
-The class internally tracks:
-- The Redis connection URL
-- The Redis client instance
-- Whether a successful connection has been established
+The class stores the configured Redis URL, the client object, and an `is_connected` flag. `get_client()` returns the client only after a successful connection. `ping()` returns a boolean and does not retry or reconnect.
 
 ---
 
 ## 8. Connecting to Redis
 
-### Startup behavior
-
-At application startup, the Redis client:
-- Creates a Redis connection from the configured URL
-- Sends a `PING` command to verify connectivity
-- Retries the connection a limited number of times if it fails
-
-If Redis is still unavailable after retries, the application stops.
-
-This ensures the app never runs in a partially broken state.
+`connect()` tries to ping Redis up to three times, waiting two seconds between failed attempts. A successful ping marks the client connected. If all attempts fail, the final exception is raised and application startup does not complete.
 
 ---
 
 ## 9. Accessing the Redis Client
 
-A dedicated method is used to return the Redis client.
-
-Before returning the client, it verifies:
-- A connection was established
-- The internal state is valid
-
-If Redis is accessed incorrectly (for example, before connecting), an error is raised immediately.
-
-This prevents silent failures and hard-to-debug runtime issues.
+The rate limiter obtains the client through `redis_client.get_client()`. This keeps connection setup out of the rate-limiting calculation and makes use before startup an explicit error.
 
 ---
 
 ## 10. Health Checks
 
-The Redis client provides a lightweight health check method that:
-- Sends a `PING` command
-- Returns a boolean indicating current availability
+`RedisClient.ping()` sends one Redis `PING` and returns `True` or `False`. `GET /health` uses that result. A successful ping produces `200`; a failed ping produces `503` with `{"detail":"Service Unavailable"}`.
 
-This method:
-- Does not retry
-- Does not reconnect
-- Does not modify state
-
-It is meant only for observing system health.
+After a successful ping, `/health` performs a rate-limit check for `demo:health` and adds `X-RateLimit-Remaining`, `X-RateLimit-Limit`, and `X-RateLimit-Reset` headers. That check consumes one token.
 
 ---
 
 ## 11. Shutdown Handling
 
-When the application shuts down:
-- The Redis connection is closed cleanly
-- Internal state is reset
-
-This prevents resource leaks and ensures clean termination, especially in async environments.
+The FastAPI lifespan closes the Redis client at shutdown with `aclose()` and resets the connection state.
 
 ---
 
 ## 12. Application Startup (`main.py`)
 
-`main.py` acts as the orchestrator of the system lifecycle.
-
-Its responsibilities are:
-1. Start the application
-2. Initialize Redis
-3. Execute application logic
-4. Shut down Redis cleanly
-
-It does not contain configuration parsing or Redis logic itself. It simply controls **when** things happen.
+The lifespan function connects to Redis before yielding control to the application and closes Redis after the application stops. Logging is configured from `LOG_LEVEL`, whose default is `INFO`.
 
 ---
 
 ## 13. What Is Intentionally Not Included
 
-The following are deliberately kept out of config and Redis modules:
-- Rate limiting logic
-- Request handling
-- Business rules
-- API framework code
-
-This separation keeps the system modular, testable, and easy to extend.
+The repository does not include authentication, middleware integration, configurable CORS origins, a fail-open/fail-closed switch, or rate limits supplied through environment variables. The HTTP API is limited to `/health` and `/check`.
 
 ---
 
 ## 14. Why This Design Was Chosen
 
-This approach provides:
-- Early failure for invalid configuration
-- Clear ownership of responsibilities
-- Predictable startup and shutdown behavior
-- A structure that scales to real production systems
-
-The same pattern can be reused for other external services such as databases, message queues, or third-party APIs.
+Configuration, Redis lifecycle, rate-limit calculations, and HTTP formatting are kept in separate modules. This matches the current repository structure and makes each responsibility visible in the code.
 
 ---
 
-## 15. Summary
+## 15. Token-Bucket Algorithm
 
-In this project:
-- Configuration is loaded and validated once, at startup
-- Redis is treated as a required external dependency
-- Connection lifecycle is explicit and controlled
-- The rest of the codebase can assume a valid, ready system
+For a tier with `limit` and `window`, capacity is `limit` and the refill rate is `limit / window` tokens per second. The first request starts with a full bucket. Each allowed request subtracts one token. The calculated token count is capped at the tier capacity.
 
-This results in simpler application logic and fewer runtime surprises.
+The bucket state is JSON with the fields `tokens` and `last_refill`. It is stored at `rate_limit:{tier}:{identifier}` with a Redis TTL of `2 × window`. Including the tier in the key gives the same identifier independent buckets for `free`, `pro`, and `enterprise`.
+
+If fewer than one token is available, the request is denied without changing the bucket. `retry_after` is calculated from the time needed to refill one token and is at least one second.
 
 ---
+
+## 16. Atomic Check-and-Update
+
+The limiter uses a Redis optimistic transaction. It watches the bucket key, reads the state, calculates the refill and decrement, queues the `SET` with `MULTI`, and commits it with `EXEC`.
+
+Without the transaction, concurrent requests could read the same token count and overwrite one another's decrements. If another request changes the watched key before `EXEC`, Redis raises `WatchError`. The limiter waits for a random delay and retries, up to `MAX_ATTEMPTS` (50). When retries are exhausted, it raises `RateLimiterBusy`; `/check` converts that condition to `503` with `Retry-After: 1`.
+
+---
+
+## 17. Summary
+
+The service stores token-bucket state in Redis, validates tier configuration from YAML, and uses an optimistic transaction for each check-and-update. The HTTP layer reports allowed, rate-limited, invalid-tier, and Redis/contention-failure outcomes with the corresponding status codes and headers.
+
 ---
 
 # FastAPI Application Layer
 
-This section explains how the rate limiter is exposed as an HTTP service. The API acts as a thin execution layer: it validates requests, delegates logic to the rate limiter core, and formats responses.
+This section describes the HTTP layer. It validates the request, delegates to the rate limiter, and formats the result; it does not calculate tokens itself.
 
-The API does **not** implement rate limiting logic itself. All business rules exist in `rate_limiter.py`.
+## 18. Application Lifecycle
 
----
+FastAPI lifespan events connect to Redis before serving requests and close the client during shutdown. A startup connection failure prevents normal application startup.
 
-## 16. Application Lifecycle
+## 19. Data Contracts
 
-The application uses FastAPI **lifespan events** to manage Redis connections.
-
-**Startup:**
-- Establish connection to Redis
-- Service becomes ready only after Redis is reachable
-
-**Shutdown:**
-- Gracefully close Redis connection
-- Prevents hanging sockets and resource leaks
-
-This guarantees:
-- Every request runs with a valid Redis client
-- No lazy connection creation during traffic
-
----
-
-## 17. Data Contracts
-
-### Request Model
-
-The client sends:
+The request model is:
 
 ```json
 {
@@ -288,265 +146,122 @@ The client sends:
 }
 ```
 
-Rules:
-- `identifier` uniquely identifies the caller
-- `tier` is optional — missing tier defaults to `"free"`
+`identifier` is required. `tier` is optional and defaults to the configured default tier.
 
-### Response Model
-
-**Successful request:**
+An allowed `/check` response is `200`:
 
 ```json
 {
   "allowed": true,
   "tokens_remaining": 99,
-  "reset_at": 1700000000.0,
-  "limit": 100
-}
-```
-
-**Rate limited:**
-
-```json
-{
-  "allowed": false,
-  "tokens_remaining": 0,
-  "reset_at": 1700000000.0,
+  "reset_at": 1792304263.3635762,
   "limit": 100,
-  "retry_after": 60
+  "retry_after": null
 }
 ```
 
----
-
-## 18. Endpoints
-
-### GET /health
-
-**Purpose:** Operational readiness check.
-
-Behavior:
-- Pings Redis
-- Confirms dependency availability
-
-Response:
+A rate-limited response is `429` with this body shape and a matching `Retry-After` header:
 
 ```json
 {
-  "status": "ok",
-  "redis": "connected"
+  "detail": {
+    "allowed": false,
+    "retry_after": 1,
+    "reset_at": 1792304227.1306272,
+    "limit": 100
+  }
 }
 ```
 
-If Redis is unavailable: **HTTP 503** is returned.
+## 20. Endpoints
 
-This endpoint is designed for load balancers and container orchestration systems.
+### `GET /health`
 
-### POST /check
+The endpoint pings Redis. A successful ping returns `200` and `{"status":"ok","redis":"connected"}`. A failed ping returns `503` and `{"detail":"Service Unavailable"}`. On success, the endpoint also checks `demo:health` and returns the rate-limit headers.
 
-**Purpose:** Evaluate whether a request should be allowed.
+### `POST /check`
 
-Flow:
-1. Validate that the tier exists in configuration
-2. Call rate limiter core
-3. Convert result into API response
+The endpoint validates the tier, calls the limiter, and returns the result. Invalid tiers return `400`. Allowed requests return `200`. Denied requests return `429` with `Retry-After`. Redis errors and `RateLimiterBusy` return `503` with `Retry-After: 1`.
 
-| Scenario         | HTTP Status |
-|------------------|-------------|
-| Invalid tier     | 400         |
-| Internal failure | 500         |
+| Scenario | Status |
+|---|---:|
+| Invalid tier | `400` |
+| Allowed | `200` |
+| Rate limited | `429` |
+| Redis or contention failure | `503` |
 
----
+## 21. Error Handling Strategy
 
-## 19. Error Handling Strategy
+The API preserves the distinction between client input errors, rate limiting, and temporary service conditions:
 
-| Code | Meaning                                |
-|------|----------------------------------------|
-| 400  | Client error (bad tier)                |
-| 429  | Rate limit exceeded (from limiter)     |
-| 503  | Dependency failure (Redis down)        |
-| 500  | Unexpected internal error              |
+| Code | Meaning |
+|---:|---|
+| `400` | The requested tier is not configured. |
+| `429` | The bucket has fewer than one token. |
+| `503` | Redis is unavailable or optimistic retries were exhausted. |
 
-The API layer never hides system state.
+## 22. Architectural Responsibility
 
----
+**API layer:** request validation, HTTP status codes, response bodies, headers, and Redis-dependent error handling.
 
-## 20. Architectural Responsibility
+**Rate limiter core:** token calculations, tier-key construction, Redis state reads and writes, and optimistic transaction retries.
 
-**API Layer:**
-- Input validation
-- Output formatting
-- Dependency lifecycle
-- HTTP semantics
+**Configuration and Redis modules:** settings validation and connection lifecycle.
 
-**Rate Limiter Core:**
-- Token calculations
-- Redis state management
-- Algorithm correctness
+## 23. API Behavior That Callers Must Account For
 
-This separation allows:
-- Algorithm testing without HTTP
-- API changes without touching logic
-- Independent scalability
+`/check` has no authentication. CORS origins are hard-coded in `main.py`. `/health` consumes one token from `demo:health`. Rate-limit state is held only in Redis, so Redis is required for checks.
 
----
-
-## 21. API Guarantees
-
-The API guarantees:
-
-- Deterministic validation
-- No business logic duplication
-- Stateless request handling
-- Externalized state in Redis
-
----
 ---
 
 # API Testing Documentation
 
-This section explains how the rate limiter service is tested from a client's perspective. The goal is not verifying Python functions, but verifying **service guarantees** through observable behavior.
+The tests use `httpx.AsyncClient` with the FastAPI application and a live Redis server. They exercise the observable HTTP behavior and the configuration and refill behavior needed by the limiter.
 
-The tests simulate how a real consumer interacts with the system:
-- Sends HTTP requests
-- Receives responses
-- Relies on response semantics
+## 24. Testing Strategy
 
-This represents **behavioral contract testing**.
+The suite checks health responses, headers, token decrementing, default and configured tiers, invalid input, rate-limit enforcement, identifier and tier isolation, concurrent atomicity, refill timing, environment defaults, Redis failure, and contention exhaustion.
 
----
+## 25. Shared Test Setup (`conftest.py`)
 
-## 22. Testing Strategy
+Before importing `main`, the test setup defaults `REDIS_URL` to `redis://localhost:6379/15` when the variable is unset. The async fixtures connect to Redis, flush the selected database before each test, provide an `httpx.AsyncClient`, and close Redis afterward. An existing `REDIS_URL` value overrides the test default.
 
-The system depends on:
-- FastAPI application
-- Redis state storage
-- Token bucket algorithm
+## 26. Test Groups
 
-Because of this, unit testing individual functions is insufficient. We instead test **observable behavior** using an async HTTP client.
+The current test functions are:
 
-We validate:
+| Test | Purpose |
+|---|---|
+| `test_health_check` | Healthy Redis response. |
+| `test_health_returns_rate_limit_header` | Health rate-limit header. |
+| `test_check_returns_rate_limit_headers` | Check rate-limit headers. |
+| `test_rate_limit_allowed` | First request allowed. |
+| `test_tokens_decrement` | Repeated requests decrement tokens. |
+| `test_default_tier` | Default tier selection. |
+| `test_invalid_tier` | Invalid tier returns `400`. |
+| `test_rate_limit_exceeded` | Exhausted bucket returns `429`. |
+| `test_different_identifiers_independent` | Identifier isolation. |
+| `test_pro_tier_higher_limit` | Pro-tier configuration. |
+| `test_concurrent_requests_are_atomic` | Atomic concurrent enforcement. |
+| `test_retry_after_header_matches_body` | Matching retry header and body. |
+| `test_refill_over_time` | Refill after elapsed time. |
+| `test_tier_buckets_are_isolated` | Tier isolation. |
+| `test_health_returns_503_when_redis_is_unreachable` | Health failure status. |
+| `test_env_defaults` | Environment defaults. |
+| `test_contention_exhausted_returns_503` | Contention failure status. |
 
-| Category      | Meaning                              |
-|---------------|--------------------------------------|
-| Availability  | Service is reachable                 |
-| Correctness   | Tokens decrement properly            |
-| Persistence   | Redis state survives across requests |
-| Safety        | Invalid input handled safely         |
-| Protection    | Limit enforced                       |
-| Isolation     | Users do not affect each other       |
-| Configuration | Tier limits applied correctly        |
-
----
-
-## 23. Shared Test Setup (`conftest.py`)
-
-### Why this file exists
-
-Tests require:
-1. Redis connected
-2. Redis clean before each test
-3. Async HTTP client
-
-Instead of repeating this setup in every test, fixtures provide a reusable environment.
-
-### Client Fixture
-
-Creates an `AsyncClient` connected to the FastAPI app.
-
-Steps:
-1. Connect Redis
-2. Create in‑memory HTTP client
-3. Run test
-4. Close Redis
-
-This ensures each test interacts with a real running application instance.
-
-### flush_redis Fixture
-
-Automatically clears the database before every test.
-
-Why required: Rate limiting depends on stored state. If state persists between tests, results become non‑deterministic.
-
-Therefore every test starts from identical conditions.
+The final verification command `pytest -q` reported `17 passed in 3.46s` in the checked environment.
 
 ---
 
-## 24. Test Groups
+## 27. Testing Notes
 
-### 1. Health Check
+The concurrency test uses a patched free tier of 20 tokens and sends 100 simultaneous requests for one identifier. The refill test replaces the limiter's clock with a controlled fake clock. The contention test sets `MAX_ATTEMPTS` to zero so the API's `503` path is directly observable.
 
-**Purpose:** Verify service readiness for traffic.
-
-Guarantees:
-- API reachable
-- Redis reachable
-- System safe to send requests
-
-This protects load balancers from routing traffic to broken instances.
-
-### 2. Valid Request Behavior
-
-Ensures normal users are not incorrectly blocked.
-
-Verified:
-- First request allowed
-- Token count decreases
-- Default tier works
-
-This confirms basic service functionality.
-
-### 3. Invalid Input Handling
-
-Ensures bad client input does not crash the server.
-
-- Invalid tier → **400** response
-
-This distinguishes client error from server failure — important for monitoring systems.
-
-### 4. Rate Limit Enforcement
-
-Core guarantee of the project.
-
-Behavior:
-- N requests → allowed
-- N+1 request → rejected
-
-Also provides retry information.
-
-**If this test fails, the system is not a rate limiter.**
-
-### 5. Identifier Isolation
-
-Ensures independent quotas per user.
-
-Without this: one abusive user would block all others.
-
-This validates key‑based state separation.
-
-### 6. Tier Differences
-
-Ensures configuration correctness.
-
-Paid tiers must have higher limits. This prevents billing inconsistencies.
+The separate `scripts/two_instance_check.py` sends 300 alternating requests to two base URLs. In a local run with two uvicorn instances and one Redis, it printed 102 `200` responses, 198 `429` responses, and an elapsed time of 8.340 seconds.
 
 ---
 
-## 25. Why Async HTTP Testing
+## 28. Scope of These Tests
 
-The system is:
-- Asynchronous
-- Network‑facing
-- Stateful (external storage)
-
-Therefore the correct testing method is **integration testing via HTTP**, not direct function calls.
-
----
-
-## 26. What These Tests Prove
-
-Together the suite guarantees:
-
-> The service enforces rate limits correctly, consistently, safely, and independently for all clients.
-
-This verifies **production‑level behavior** rather than implementation details.
+The tests verify the behaviors listed in the test table against the current implementation. They do not verify authentication, configurable CORS, fail-open/fail-closed behavior, clock synchronization between servers, or persistence outside Redis.

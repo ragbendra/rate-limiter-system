@@ -6,15 +6,13 @@ from typing import Dict
 load_dotenv()
 
 class EnvConfig(BaseModel):
-    redis_url: str
+    redis_url: str = "redis://localhost:6379"
     log_level: str = "INFO"
-    fail_mode: str = "CLOSED"
 
 def load_env() -> EnvConfig:
     return EnvConfig(
-        redis_url= os.getenv("REDIS_URL"),
-        log_level= os.getenv("LOG_LEVEL"),
-        fail_mode= os.getenv("FAIL_MODE")
+        redis_url=os.getenv("REDIS_URL", "redis://localhost:6379"),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
     )
 
 class Tier(BaseModel):

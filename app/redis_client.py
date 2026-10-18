@@ -21,7 +21,12 @@ class RedisClient:
         retry_delay = 2 # seconds
         for attempt in range(max_retries):
             try:
-                self.client = redis.from_url(self.redis_url) # create redis client
+                pool = redis.BlockingConnectionPool.from_url(
+                    self.redis_url,
+                    max_connections=100,
+                    timeout=10,
+                )
+                self.client = redis.Redis(connection_pool=pool)
                 await self.client.ping()  # force connection to redis
                 self.is_connected = True # set connection status or commit
                 logger.info("Connected to Redis successfully.")
@@ -45,7 +50,7 @@ class RedisClient:
 
     async def close(self):
         if self.client:
-            await self.client.close()
+            await self.client.aclose()
             self.is_connected = False
             self.client = None
 
