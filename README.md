@@ -220,6 +220,23 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
+### Continuous integration
+
+GitHub Actions runs the test suite on pushes to `main` and on pull requests. The workflow starts a disposable Redis service, installs `requirements-dev.txt` with Python 3.11, and runs `pytest -q`. After the tests pass, it builds the Docker image locally without publishing it. See [the CI workflow](.github/workflows/ci.yml).
+
+To run the same test command locally, start Redis first, then run:
+
+```bash
+REDIS_URL=redis://localhost:6379/15 python -m pytest -q
+```
+
+In PowerShell, set the environment variable for the command like this:
+
+```powershell
+$env:REDIS_URL = "redis://localhost:6379/15"
+python -m pytest -q
+```
+
 Before importing the application, `tests/conftest.py` defaults `REDIS_URL` to `redis://localhost:6379/15` unless that variable is already set. Each test flushes the selected Redis database. This avoids flushing the developer's default Redis database during local test runs.
 
 The current test names and purposes are:
