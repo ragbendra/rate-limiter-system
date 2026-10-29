@@ -1,5 +1,7 @@
 # Rate Limiter System
 
+[![CI](https://github.com/ragbendra/rate-limiter-system/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ragbendra/rate-limiter-system/actions/workflows/ci.yml)
+
 A rate-limit decision API that implements a token bucket with its state in Redis. Clients call `POST /check` to decide whether an identified request may proceed. This project is an HTTP service, not framework middleware; `/check` is intentionally unauthenticated.
 
 ## Features
